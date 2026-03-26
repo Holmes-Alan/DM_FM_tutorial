@@ -16,3 +16,6 @@ Diffusion Model and Flow Matching Tutorial
 
 ### Visual comparison
 ![Visual results](/Figure/all_models_samples.png)
+
+
+The code is based on tutorial materials and was partially developed with the assistance of Claude; therefore, it may contain some errors.
