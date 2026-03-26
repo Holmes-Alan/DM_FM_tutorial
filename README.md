@@ -1,6 +1,8 @@
 # DM_FM_tutorial
 Diffusion Model and Flow Matching Tutorial
 
+[![Open DM_FM in Colab](https://colab.research.google.com/github/Holmes-Alan/DM_FM_tutorial/blob/main/DM_FM_Tutorial.ipynb)
+
 # BibTex
 
         @InProceedings{Liu2026tutorial,
