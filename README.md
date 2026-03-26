@@ -5,7 +5,7 @@ Diffusion Model and Flow Matching Tutorial
 
         @InProceedings{Liu2026tutorial,
             author = {Zhi-Song Liu},
-            title = {Flow-based generative models, from theory to model design},
+            title = {Flow-based generative models: from theory to model design},
             month = {March},
             year = {2026}
         }
