@@ -696,7 +696,7 @@ class DriftingModel(nn.Module):
         old_gen = gen.detach()
 
         if fixed_neg is None:
-            fixed_neg = torch.zeros(N, 0, D, device=device)  # empty
+            fixed_neg = torch.zeros(0, D, device=device)  # empty [0, D]
 
         # targets = [old_gen | fixed_neg | fixed_pos]  — same order as JAX
         targets = torch.cat([old_gen, fixed_neg, fixed_pos], dim=0)  # [C_g+C_n+C_p, D]
@@ -1005,7 +1005,7 @@ def train_drifting(data, args, device, save_dir):
     # drifting quality scales with batch size (more negatives = better signal)
     # use at least 2048 as in the reference, fall back to args.batch if larger
     batch = max(args.batch, 2048)
-    model = DriftingModel(noise_dim=32, hidden=256, depth=4, temp=0.05).to(device)
+    model = DriftingModel(noise_dim=32, hidden=256, depth=4, R_list=(0.02, 0.05, 0.2)).to(device)
     opt   = optim.Adam(model.parameters(), lr=args.lr)
     losses = []
 
@@ -1146,15 +1146,10 @@ if __name__ == '__main__':
     main()
 
 
-# MODEL  = 'score'      # ← change me
-# EPOCHS = 3000        # 3000 is fast; use 5000–8000 for best quality
-# LR     = 3e-4
-# BATCH  = 512
-# N_DATA = 16000       # match tiny-rf: 16k points from 142 boundary pts
-
-# !python train.py --model {MODEL} --epochs {EPOCHS} --lr {LR} --batch {BATCH} --n_data {N_DATA}
 
 # MODELS  = ['vae','ddpm','score','consistency','flow','rectified','meanflow','drifting']
 # EPOCHS  = {'vae':3000,'ddpm':3000,'score':3000,'consistency':5000,
 #            'flow':3000,'rectified':4000,'meanflow':4000,'drifting':4000}
 # timings = {}
+
+# !python train.py --model {MODEL} --epochs {EPOCHS} 
