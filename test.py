@@ -191,7 +191,7 @@ def load_model(model_name, ckpt_dir, device):
     elif model_name == 'meanflow':
         m = MeanFlowModel(hidden=256, depth=4)
     elif model_name == 'drifting':
-        m = DriftingModel(noise_dim=32, hidden=256, depth=4, temp=0.05)
+        m = DriftingModel(noise_dim=32, hidden=256, depth=4, R_list=(0.02, 0.05, 0.2))
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
