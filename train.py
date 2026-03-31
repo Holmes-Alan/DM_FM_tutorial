@@ -662,11 +662,10 @@ class DriftingModel(nn.Module):
     Sampling: one forward pass z∼N(0,I) → net(z).  1-NFE, no ODE.
     """
 
-    def __init__(self, noise_dim=32, hidden=256, depth=4, temp=0.05):
+    def __init__(self, noise_dim=32, hidden=256, depth=4, R_list=(0.02, 0.05, 0.2)):
         super().__init__()
         self.noise_dim = noise_dim
-        self.temp      = temp
-        # SELU activation: self-normalising, matches paper architecture
+        self.R_list    = R_list          # replaces temp — multi-scale radii
         layers = [nn.Linear(noise_dim, hidden), nn.SELU()]
         for _ in range(depth - 1):
             layers += [nn.Linear(hidden, hidden), nn.SELU()]
@@ -677,64 +676,106 @@ class DriftingModel(nn.Module):
         return self.net(z)
 
     @staticmethod
-    def compute_drift(x, y_pos, y_neg, temp=0.05):
+    def compute_drift(gen, fixed_pos, fixed_neg=None, R_list=(0.02, 0.05, 0.2)):
         """
-        Mean-shift drifting field V (Algorithm 2, Deng et al. 2026).
-
-        V(xᵢ) = Σⱼ Σₖ A_pos[i,j] · A_neg[i,k] · (y_pos[j] − y_neg[k])
-
-        where A is a doubly-normalised affinity matrix (geometric mean of
-        row-softmax and column-softmax), computed in log-space for stability.
+        Faithful PyTorch port of drift_loss() from the JAX reference.
 
         Args:
-            x:     query points = generated samples  [N, D]
-            y_pos: positive samples = real data       [N_pos, D]
-            y_neg: negative samples = generated (=x)  [N_neg, D]
-            temp:  kernel temperature (paper default: 0.05)
+            gen:       [N, D]  generated samples (query points)
+            fixed_pos: [N_p, D] positive (real) samples
+            fixed_neg: [N_n, D] negative samples (optional)
+            R_list:    tuple of kernel radii for multi-scale drift
         Returns:
-            V: drift vectors [N, D]
+            goal_scaled: [N, D]  target in scaled space
+            scale_inputs: scalar  scale factor (needed for loss computation)
         """
-        N = x.shape[0]
+        N, D = gen.shape
+        device = gen.device
 
-        # pairwise L2 distances in log-kernel space (numerically stable)
-        dist_pos = torch.cdist(x, y_pos)              # [N, N_pos]
-        dist_neg = torch.cdist(x, y_neg)              # [N, N_neg]
+        # stop-gradient copy of gen — used as self-repulsion negatives
+        old_gen = gen.detach()
 
-        # mask self-interactions when y_neg is the same set as x
-        if N == y_neg.shape[0]:
-            dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
+        if fixed_neg is None:
+            fixed_neg = torch.zeros(N, 0, D, device=device)  # empty
 
-        # joint logit matrix: -dist/temp for all positives and negatives
-        logit = torch.cat([-dist_pos / temp,
-                           -dist_neg / temp], dim=1)  # [N, N_pos+N_neg]
+        # targets = [old_gen | fixed_neg | fixed_pos]  — same order as JAX
+        targets = torch.cat([old_gen, fixed_neg, fixed_pos], dim=0)  # [C_g+C_n+C_p, D]
+        C_g = old_gen.shape[0]
+        C_n = fixed_neg.shape[0]
+        C_p = fixed_pos.shape[0]
 
-        # doubly-normalised affinity: geometric mean of row- and col-softmax
-        A_row = logit.softmax(dim=-1)                 # normalise over y
-        A_col = logit.softmax(dim=-2)                 # normalise over x
-        A = (A_row * A_col).sqrt()                    # [N, N_pos+N_neg]
+        # pairwise distances: [N, C_g+C_n+C_p]
+        dist = torch.cdist(old_gen, targets)  # [C_g, C_g+C_n+C_p]
 
-        N_pos = y_pos.shape[0]
-        A_pos = A[:, :N_pos]                          # [N, N_pos]
-        A_neg = A[:, N_pos:]                          # [N, N_neg]
+        # adaptive scale: mean pairwise distance (weighted uniformly here)
+        scale = dist.mean().clamp(min=1e-3)
+        scale_inputs = (scale / (D ** 0.5)).clamp(min=1e-3)
 
-        # factorised weights (avoids O(N·N_pos·N_neg) explicit triple sum)
-        W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
-        W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
+        old_gen_scaled = old_gen / scale_inputs
+        targets_scaled = targets / scale_inputs
+        dist_normed = dist / scale.clamp(min=1e-3)
 
-        return W_pos @ y_pos - W_neg @ y_neg          # [N, D]
+        # diagonal mask: mask gen[i] vs gen[i] self-interaction
+        # block_mask shape: [C_g, C_g+C_n+C_p]
+        diag_mask = torch.eye(C_g, device=device)
+        block_mask = torch.nn.functional.pad(diag_mask, (0, C_n + C_p))  # [C_g, C_g+C_n+C_p]
+        dist_normed = dist_normed + block_mask * 100.0
+
+        # multi-scale force accumulation
+        force_across_R = torch.zeros_like(old_gen_scaled)
+
+        for R in R_list:
+            logits = -dist_normed / R  # [C_g, C_g+C_n+C_p]
+
+            # doubly-normalised affinity: geometric mean of row- and col-softmax
+            A_row = torch.softmax(logits, dim=-1)   # normalise over targets
+            A_col = torch.softmax(logits, dim=-2)   # normalise over queries
+            affinity = (A_row * A_col).clamp(min=1e-6).sqrt()  # [C_g, C_g+C_n+C_p]
+
+            # split into neg (gen+fixed_neg) and pos (fixed_pos) blocks
+            split_idx = C_g + C_n
+            aff_neg = affinity[:, :split_idx]   # [C_g, C_g+C_n]
+            aff_pos = affinity[:, split_idx:]   # [C_g, C_p]
+
+            # factorised force coefficients
+            sum_pos = aff_pos.sum(dim=-1, keepdim=True)   # [C_g, 1]
+            sum_neg = aff_neg.sum(dim=-1, keepdim=True)   # [C_g, 1]
+            r_coeff_neg = -aff_neg * sum_pos              # [C_g, C_g+C_n]
+            r_coeff_pos =  aff_pos * sum_neg              # [C_g, C_p]
+
+            R_coeff = torch.cat([r_coeff_neg, r_coeff_pos], dim=-1)  # [C_g, C_g+C_n+C_p]
+
+            # force = weighted sum of target positions
+            force_R = R_coeff @ targets_scaled             # [C_g, D]
+
+            # subtract self-component (R_coeff rows sum to 0 in balanced case)
+            total_coeffs = R_coeff.sum(dim=-1, keepdim=True)  # [C_g, 1]
+            force_R = force_R - total_coeffs * old_gen_scaled
+
+            # normalize this scale's force before accumulating
+            f_norm = (force_R ** 2).mean().clamp(min=1e-8).sqrt()
+            force_across_R = force_across_R + force_R / f_norm
+
+        goal_scaled = old_gen_scaled + force_across_R
+        return goal_scaled, scale_inputs
+
 
     def drifting_loss(self, x_real):
         """
-        Algorithm 1: L = mean_i ||(gen_i) − stopgrad(gen_i + V_i)||²
-        V is computed under no_grad; gradients flow only through gen.
+        Algorithm 1 loss in scaled coordinate space — matches JAX reference.
         """
         z   = torch.randn(x_real.shape[0], self.noise_dim, device=x_real.device)
-        gen = self(z)
+        gen = self(z)  # [N, D], has gradient
+
         with torch.no_grad():
-            V      = self.compute_drift(gen, x_real, gen, self.temp)
-            target = (gen + V).detach()
-        # sum over D per sample, then mean over batch (matches reference)
-        return ((gen - target) ** 2).sum(dim=-1).mean()
+            goal_scaled, scale_inputs = self.compute_drift(
+                gen, fixed_pos=x_real, fixed_neg=None, R_list=self.R_list
+            )
+
+        # loss in scaled space — gen also scaled, goal_scaled is stop-gradient
+        gen_scaled = gen / scale_inputs
+        diff = gen_scaled - goal_scaled          # [N, D]
+        return (diff ** 2).mean()               # mean over both N and D (matches JAX axis=(-1,-2))
 
     @torch.no_grad()
     def sample(self, n, device, **_):
